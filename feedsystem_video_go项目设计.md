@@ -2,6 +2,154 @@
 
 > 项目介绍：本项目是一款由 Go + Vue 3 开发的短视频 Feed 流系统，提供账号、视频、点赞、评论、关注（Social）、Feed、私信与通知接口，并通过 Redis、RabbitMQ、分片上传、SSE 与 Docker Compose 提升性能、体验和部署效率。
 
+## 架构设计
+
+> "我采用了经典的分层架构，对外是 Handler 负责 HTTP 解析，Service 承载业务逻辑，Repository 只做数据访问，底层是 Entity 实体。分包上我选择按业务域而不是按技术层来组织，账号、视频、社交各是独立的包、各自包含四层，这样高内聚、改一个功能不用跨很多目录；公共的数据库、缓存、消息队列、鉴权和限流抽到共享包。另外后台消费者和 Web 服务分成两个独立进程部署。"
+
+### 一、分层架构（每个业务包内部）
+
+每个业务域（account / video / social / feed / message…）内部都是统一的四层，
+对应常见教程里的 `controller / service / dao / model`，只是命名不同：
+
+```
+┌──────────────────────────────────────────────────────────────┐
+│                        HTTP 请求 / 响应                       │
+└──────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌──────────────────────────────────────────────────────────────┐
+│  Handler 层  ( = Controller )                                │
+│  · 解析请求参数 / 绑定 JSON      · 调用 Service               │
+│  · 身份从 JWT 获取（不信任前端）  · 组装并返回 JSON 响应       │
+│  例：account/handler.go、video/video_handler.go              │
+└──────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌──────────────────────────────────────────────────────────────┐
+│  Service 层  ( = 业务逻辑层 )                                 │
+│  · 业务规则 / 参数校验   · bcrypt 哈希   · 事务控制            │
+│  · 缓存读写（Cache-Aside）· 发布 MQ 事件  · 降级/兜底编排      │
+│  例：account/service.go、video/video_service.go              │
+└──────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌──────────────────────────────────────────────────────────────┐
+│  Repository 层 ( = DAO )                                     │
+│  · 只写 GORM / SQL，不含业务逻辑                              │
+│  · CRUD、IN 批量查询、JOIN、gorm.Expr 计数更新                │
+│  例：account/repo.go、video/video_repo.go                    │
+└──────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌──────────────────────────────────────────────────────────────┐
+│  Entity 层   ( = Model )                                     │
+│  · 数据结构体 + GORM/JSON tag，定义表与字段映射               │
+│  例：account/entity.go、video/video_entity.go                │
+└──────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+                          ┌───────┐
+                          │ MySQL │
+                          └───────┘
+
+命名对照：Handler=Controller · Service=Service · Repository=DAO · Entity=Model
+依赖方向只能自上而下，不能反向或跨层直连（私信模块 h.service.repo 属待改进点）
+```
+
+### 二、系统整体架构（按业务域分包 + 两个独立进程）
+
+```mermaid
+flowchart TB
+    subgraph Client["🖥️ 客户端"]
+        Vue["Vue 3 前端<br/>Vite + Pinia"]
+    end
+
+    subgraph APIProc["⚙️ 进程一：Web 服务 (cmd/main.go)"]
+        direction TB
+        Router["http/router.go<br/>路由总装配"]
+        MW["中间件<br/>JWT 鉴权 / SoftJWTAuth · 限流 ratelimit"]
+        Health["/healthz 健康检查 · pprof:6060"]
+
+        subgraph Domains["业务域包（各含 Handler→Service→Repository→Entity）"]
+            direction LR
+            account["account<br/>账号"]
+            video["video<br/>视频/点赞/评论/分片"]
+            social["social<br/>关注"]
+            feed["feed<br/>信息流"]
+            message["message<br/>私信"]
+        end
+
+        Outbox["OutboxPoller<br/>轮询发件箱"]
+        TimelineC["TimelineConsumer<br/>写全局时间线"]
+        SSEHub["SSEHub<br/>通知长连接中心"]
+    end
+
+    subgraph WorkerProc["🔧 进程二：Worker (cmd/worker/main.go)"]
+        direction TB
+        LikeW["LikeWorker"]
+        CommentW["CommentWorker"]
+        SocialW["SocialWorker"]
+        PopW["PopularityWorker"]
+        NotifW["NotificationWorker"]
+        WProf["pprof:6061"]
+    end
+
+    subgraph Infra["☁️ 基础设施"]
+        MySQL[("MySQL 8<br/>业务数据")]
+        Redis[("Redis 7<br/>缓存/榜单/锁/会话")]
+        MQ{{"RabbitMQ<br/>Topic 交换机 + DLX"}}
+        Disk["Local Disk<br/>视频/封面/分片"]
+    end
+
+    Vue -->|"/api HTTP 请求"| Router
+    Vue -.->|"SSE /notification/stream?token="| SSEHub
+
+    Router --> MW --> Domains
+    Domains -->|GORM| MySQL
+    Domains -->|缓存/分布式锁| Redis
+    Domains -->|读写文件| Disk
+    Domains -->|发布事件| MQ
+
+    video --> Outbox
+    Outbox -->|投递时间线事件| MQ
+    MQ --> TimelineC
+    TimelineC -->|ZADD 热时间线| Redis
+
+    MQ --> LikeW & CommentW & SocialW & PopW & NotifW
+    LikeW & CommentW & SocialW -->|落库| MySQL
+    PopW -->|ZINCRBY 分钟桶| Redis
+    NotifW -->|写通知| MySQL
+    NotifW -->|Push 实时推送| SSEHub
+    SSEHub -.->|"data: 通知"| Vue
+```
+
+> 说明（Mermaid 在部分 Markdown 阅读器不渲染时，可参考下图等价结构）：
+
+```
+┌─────────┐  HTTP /api          ┌──────────────── Web 进程 (cmd/main.go) ───────────────┐
+│ Vue 3   │ ───────────────────► │ Router ── 中间件(JWT/限流) ── 业务域四层             │
+│ 前端    │                     │   account · video · social · feed · message          │
+│         │ ◄─────────────────── │     │          │        │        │                   │
+│         │  SSE 通知推送        │   OutboxPoller  TimelineConsumer  SSEHub             │
+└─────────┘                     └───┬──────────┬────────┬────────────────────────────┘
+                                    │          │        │
+                              ┌─────▼──┐  ┌────▼──┐ ┌───▼────────  Worker 进程 (cmd/worker) ─┐
+                              │ MySQL  │  │ Redis │ │ LikeWorker · CommentWorker · SocialWorker │
+                              └────────┘  └───────┘ │ PopularityWorker · NotificationWorker   │
+                                                    └──────────────────┬──────────────────────┘
+                          RabbitMQ（Topic 交换机 + DLX）◄── 发布事件 ──┘ 消费事件 ──► MySQL / Redis / SSEHub
+                          Local Disk：视频、封面、分片临时文件
+```
+
+### 三、两种分包方式对比
+
+| | 按技术层分包（常见教程） | 按业务域分包（✅ 本项目） |
+|---|---|---|
+| 结构 | `models/ dao/ services/ controllers/` | `account/ video/ social/ …`（每个包含自己的四层） |
+| 改一个功能 | 要在 4 个平级目录间跳转 | 只在一个业务包内完成 |
+| 特点 | 简单直观 | 高内聚、易维护、易扩展，Go 社区主流风格 |
+| Python 类比 | 按代码类型分文件 | 类似 Django 一个 app 自带 models/views/逻辑 |
+
 # 技术栈
 
 | 维度            | 组件/工具                    | 说明                                                         |

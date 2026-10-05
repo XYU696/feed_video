@@ -1,6 +1,6 @@
 # feedsystem_video_go
 
-基于 Go + Vue 3 的短视频 Feed 系统，含账号、视频、点赞、评论、关注、Feed 流、私信、通知，支持 Redis 缓存、RabbitMQ 异步 Worker、分片上传、SSE 实时推送、Docker Compose 部署。
+基于 Go + Vue 3 的短视频 Feed 系统，含账号、视频、点赞、评论、关注、Feed 流、私信、通知、内容安全审核 Agent，支持 Redis 缓存、RabbitMQ 异步 Worker、分片上传、SSE 实时推送、Docker Compose 部署。
 
 ## 更完整的视频 Feed 流系统项目
 
@@ -18,6 +18,7 @@
 | Feed | 推荐流、关注流、点赞榜、热榜、话题流、冷热分离、游标分页、短视频沉浸播放 |
 | 私信 | 发送私信、按对端用户查看最近 50 条会话 |
 | 通知 | 点赞/评论/关注事件通知、提及通知、SSE 实时推送、通知列表、未读计数、已读标记 |
+| 内容安全 Agent | 举报提交（防刷）、LLM Function Calling 自主取证、并发证据快照、置信度分级自动处置（删视频/删评论/警告）、低置信转人工、审核台 SSE 一键终审（同意/驳回/改判）、Prompt 注入隔离、审计流水、处理结果私信通知、离线评估集 |
 | 工程 | Docker Compose、`start.sh`、API/Worker 拆分运行、限流、pprof、健康检查 |
 
 ## Docker Compose 一键启动
@@ -150,6 +151,24 @@ GitHub Actions 配置位于 `.github/workflows/ci.yml`，在 Pull Request 以及
 | POST | `/send` | JWT | 发送私信 |
 | POST | `/list` | JWT | 对话列表 |
 
+### 举报 `/report`
+| 方法 | 路径 | 鉴权 | 说明 |
+|------|------|------|------|
+| POST | `/report` | JWT | 提交举报（限流；同一用户对同一对象仅可举报一次，防刷） |
+| POST | `/report/listMy` | JWT | 我提交的举报及处理状态 |
+
+### 内容安全审核台 `/moderation`
+| 方法 | 路径 | 鉴权 | 说明 |
+|------|------|------|------|
+| POST | `/moderation/list` | JWT + 审核员 | 案件列表（可按状态筛选，pending 优先） |
+| POST | `/moderation/review` | JWT + 审核员 | 终审：approve 同意 Agent / reject 驳回 / override 改判；仅 pending 可审 |
+| GET | `/moderation/stream` | JWT + 审核员 | SSE：有案件转人工时实时推送 |
+
+> 举报提交后经 RabbitMQ 投递到 Worker：Agent 用 Function Calling 并发取证（对象/作者/评论/历史举报），
+> 高置信（删除 ≥0.85、警告 ≥0.7）自动处置，低置信或证据不足转人工；处置全程有 Redis 防重锁、
+> Prompt 注入隔离与只追加审计流水，终审/自动处置结果以私信通知举报人。设计细节见 [agent.md](agent.md)。
+> 离线评估（64 条标注集 + 指标 Runner）见 [backend/eval/README.md](backend/eval/README.md)。
+
 ## 环境变量
 
 | 变量 | 默认值 | 说明 |
@@ -165,6 +184,11 @@ GitHub Actions 配置位于 `.github/workflows/ci.yml`，在 Pull Request 以及
 | `REDIS_DB` | `0` | Redis DB |
 | `RABBITMQ_HOST` / `RABBITMQ_PORT` | 配置文件值 | RabbitMQ 地址 |
 | `RABBITMQ_USER` / `RABBITMQ_PASS` | `admin` / `password123` | RabbitMQ 账号 |
+| `AGENT_ENABLED` | `false` | 是否启用内容安全 Agent；关闭时举报全部走人工 |
+| `AGENT_API_KEY` | 无 | LLM API Key，仅从环境变量读取，不入库不入代码 |
+| `AGENT_BASE_URL` | `https://api.openai.com/v1` | OpenAI 兼容接口地址（可换任意兼容网关） |
+| `AGENT_MODEL` | 配置文件值 | 决策所用模型，如 `gpt-4o-mini` |
+| `MODERATION_REVIEWER_IDS` | `1` | 审核员账号 ID 列表，逗号分隔；非名单内访问审核台返回 403 |
 
 详见 `.env.example`。
 
@@ -174,4 +198,5 @@ GitHub Actions 配置位于 `.github/workflows/ci.yml`，在 Pull Request 以及
 - 本地配置默认开启 pprof：API `localhost:6060`，Worker `localhost:6061`。
 - 上传文件写入 `backend/.run/uploads`；Docker 环境挂载到 `backend_uploads` volume。
 - Redis 用于 Token 缓存、视频实体缓存、Feed 时间线、热榜窗口、分片上传会话。
-- RabbitMQ Topic Exchange 覆盖点赞、评论、关注、热度、视频时间线事件，并配置 DLX。
+- RabbitMQ Topic Exchange 覆盖点赞、评论、关注、热度、视频时间线、举报与审核事件，并配置 DLX。
+- 内容安全相关表：`reports`（举报）、`moderation_cases`（案件 + 证据快照）、`moderation_audit`（只追加审计流水）。
